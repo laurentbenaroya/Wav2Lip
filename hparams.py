@@ -1,16 +1,38 @@
 from glob import glob
 import os
+import pickle
 
-def get_image_list(data_root, split):
+
+def get_image_list(data_root, input_type, split):
 	filelist = []
-
-	with open('filelists/{}.txt'.format(split)) as f:
+	# if input_type == 'LIA':
+	# 	data_root = data_root.replace('/vox/dev/', '/vox/LIA/dev/')
+	with open('filelists/{}_{}.txt'.format(input_type, split)) as f:
 		for line in f:
 			line = line.strip()
 			if ' ' in line: line = line.split()[0]
 			filelist.append(os.path.join(data_root, line))
 
 	return filelist
+
+
+def get_id_list(input_type, split):
+
+	idlist = []
+	with open('filelists/{}_{}_ids.txt'.format(input_type, split)) as f:
+		for line in f:
+			line = line.strip()
+			if ' ' in line:
+				line = line.split()[0]
+			id = line.split('/')[0]
+			idlist.append(id)
+	return idlist
+
+
+def get_id_dict(filename):
+	data = pickle.load(open(filename, 'rb'))
+	name2iddict, id2namedict = data['name2iddict'], data['id2namedict']
+	return name2iddict, id2namedict
 
 class HParams:
 	def __init__(self, **kwargs):
@@ -30,6 +52,12 @@ class HParams:
 
 # Default hyperparameters
 hparams = HParams(
+
+	# person embedding
+	emb_size=256,
+	num_ids=1000,
+
+	# mel spectrogram
 	num_mels=80,  # Number of mel-spectrogram channels and local conditioning dimensionality
 	#  network
 	rescale=True,  # Whether to rescale audio prior to preprocessing
@@ -78,7 +106,7 @@ hparams = HParams(
 	
 	batch_size=16,
 	initial_learning_rate=1e-4,
-	nepochs=200000000000000000,  ### ctrl + c, stop whenever eval loss is consistently greater than train loss for ~10 epochs
+	nepochs=3,  # 200000000000000000,  ### ctrl + c, stop whenever eval loss is consistently greater than train loss for ~10 epochs
 	num_workers=16,
 	checkpoint_interval=3000,
 	eval_interval=3000,
