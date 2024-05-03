@@ -9,14 +9,17 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from torch import optim
-import torch.backends.cudnn as cudnn
+# import torch.backends.cudnn as cudnn
 from torch.utils import data as data_utils
 import numpy as np
 
 from glob import glob
 
 import os, random, cv2, argparse
-from hparams import hparams, get_image_list
+
+from hparams import hparams, get_image_list, get_id_list, get_id_dict
+
+import pdb
 
 parser = argparse.ArgumentParser(description='Code to train the Wav2Lip model WITH the visual quality discriminator')
 
@@ -41,12 +44,26 @@ syncnet_mel_step_size = 16
 
 class Dataset(object):
     def __init__(self, split):
-        self.all_videos = get_image_list(args.data_root, split)
+        # GT videos
+        self.all_gt_videos = get_image_list(args.data_root, 'preproc', split)
+        # LIA converted videos
+        self.all_LIA_videos = self.all_gt_videos  # []  # get_image_list(args.data_root, 'LIA', split)
+        self.all_gt_ids = get_id_list('preproc', split)
+        self.all_LIA_ids = self.all_gt_ids  # []  # get_id_list('LIA', split)
+        self.name2iddict, self.id2namedict = get_id_dict('filelists/id2name.pkl')
 
     def get_frame_id(self, frame):
         return int(basename(frame).split('.')[0])
 
     def get_window(self, start_frame):
+        """
+        Get the window of frames for the syncnet_T time steps
+        Args:
+            start_frame:
+
+        Returns:
+
+        """
         start_id = self.get_frame_id(start_frame)
         vidname = dirname(start_frame)
 
@@ -59,6 +76,14 @@ class Dataset(object):
         return window_fnames
 
     def read_window(self, window_fnames):
+        """
+        Read the window of frames
+        Args:
+            window_fnames:
+
+        Returns:
+
+        """
         if window_fnames is None: return None
         window = []
         for fname in window_fnames:
@@ -75,6 +100,15 @@ class Dataset(object):
         return window
 
     def crop_audio_window(self, spec, start_frame):
+        """
+        Crop the audio spectrogram to syncnet_mel_step_size time steps
+        Args:
+            spec:
+            start_frame:
+
+        Returns:
+
+        """
         if type(start_frame) == int:
             start_frame_num = start_frame
         else:
@@ -86,6 +120,15 @@ class Dataset(object):
         return spec[start_idx : end_idx, :]
 
     def get_segmented_mels(self, spec, start_frame):
+        """
+        Get syncnet_T successive segmented mels from the original mel
+        Args:
+            spec:
+            start_frame:
+
+        Returns:
+
+        """
         mels = []
         assert syncnet_T == 5
         start_frame_num = self.get_frame_id(start_frame) + 1 # 0-indexing ---> 1-indexing
@@ -108,12 +151,14 @@ class Dataset(object):
         return x
 
     def __len__(self):
-        return len(self.all_videos)
+        return len(self.all_gt_videos)
 
     def __getitem__(self, idx):
+        # pdb.set_trace()
         while 1:
-            idx = random.randint(0, len(self.all_videos) - 1)
-            vidname = self.all_videos[idx]
+            idx = random.randint(0, len(self.all_gt_videos) - 1)
+            vidname = self.all_gt_videos[idx]
+            idval = self.name2iddict[self.all_gt_ids[idx]]
             img_names = list(glob(join(vidname, '*.jpg')))
             if len(img_names) <= 3 * syncnet_T:
                 continue
@@ -144,36 +189,107 @@ class Dataset(object):
             except Exception as e:
                 continue
 
+            # Crop the audio file to syncnet_T time steps
             mel = self.crop_audio_window(orig_mel.copy(), img_name)
             
             if (mel.shape[0] != syncnet_mel_step_size):
                 continue
 
+            # Get syncnet_T successive segmented mels
+            # this one is used : syncnet_T x syncnet_mel_step_size x 80
             indiv_mels = self.get_segmented_mels(orig_mel.copy(), img_name)
             if indiv_mels is None: continue
 
             window = self.prepare_window(window)
+            # this is used : 3 x syncnet_T x H x W
             y = window.copy()
+
+            # in x append a randomly chosen window and the upper part of window/y
             window[:, :, window.shape[2]//2:] = 0.
 
             wrong_window = self.prepare_window(wrong_window)
-            x = np.concatenate([window, wrong_window], axis=0)
+            # x = np.concatenate([window, wrong_window], axis=0)
 
-            x = torch.FloatTensor(x)
+            # x = torch.FloatTensor(x)
             mel = torch.FloatTensor(mel.T).unsqueeze(0)
+            # indiv_mels : syncnet_T x 1 x syncnet_mel_step_size x 80
             indiv_mels = torch.FloatTensor(indiv_mels).unsqueeze(1)
             y = torch.FloatTensor(y)
-            return x, indiv_mels, mel, y
+            idval = torch.IntTensor([int(idval)])
 
-def save_sample_images(x, g, gt, global_step, checkpoint_dir):
-    x = (x.detach().cpu().numpy().transpose(0, 2, 3, 4, 1) * 255.).astype(np.uint8)
+            # get LIA data
+            vidname = self.all_LIA_videos[idx]
+            idval_LIA = self.name2iddict[self.all_LIA_ids[idx]]
+            img_names = list(glob(join(vidname, '*.jpg')))
+            if len(img_names) <= 3 * syncnet_T:
+                continue
+
+            img_name = random.choice(img_names)
+            wrong_img_name = random.choice(img_names)
+            while wrong_img_name == img_name:
+                wrong_img_name = random.choice(img_names)
+
+            window_fnames = self.get_window(img_name)
+            wrong_window_fnames = self.get_window(wrong_img_name)
+            if window_fnames is None or wrong_window_fnames is None:
+                continue
+
+            window = self.read_window(window_fnames)
+            if window is None:
+                continue
+
+            wrong_window = self.read_window(wrong_window_fnames)
+            if wrong_window is None:
+                continue
+
+            try:
+                wavpath = join(vidname, "audio.wav")
+                wav = audio.load_wav(wavpath, hparams.sample_rate)
+
+                orig_mel = audio.melspectrogram(wav).T
+            except Exception as e:
+                continue
+
+            # Crop the audio file to syncnet_T time steps
+            mel = self.crop_audio_window(orig_mel.copy(), img_name)
+
+            if (mel.shape[0] != syncnet_mel_step_size):
+                continue
+
+            # Get syncnet_T successive segmented mels
+            # this one is used : syncnet_T x syncnet_mel_step_size x 80
+            indiv_LIA_mels = self.get_segmented_mels(orig_mel.copy(), img_name)
+            if indiv_LIA_mels is None: continue
+
+            window = self.prepare_window(window)
+            # this is used : 3 x syncnet_T x H x W
+            y_LIA = window.copy()
+
+            # in x append a randomly chosen window and the upper part of window/y
+            # window[:, :, window.shape[2] // 2:] = 0.
+
+            wrong_window = self.prepare_window(wrong_window)
+            # x = np.concatenate([window, wrong_window], axis=0)
+
+            # x = torch.FloatTensor(x)
+            # mel = torch.FloatTensor(mel.T).unsqueeze(0)
+            # indiv_mels : syncnet_T x 1 x syncnet_mel_step_size x 80
+            indiv_LIA_mels = torch.FloatTensor(indiv_LIA_mels).unsqueeze(1)
+            y_LIA = torch.FloatTensor(y_LIA)
+            idval_LIA = torch.IntTensor([int(idval_LIA)])
+
+            return (indiv_mels, y, idval, mel), (indiv_LIA_mels, y_LIA, idval_LIA)
+            # return x, indiv_mels, mel, y
+
+def save_sample_images(g, gt, global_step, checkpoint_dir):
+    # x = (x.detach().cpu().numpy().transpose(0, 2, 3, 4, 1) * 255.).astype(np.uint8)
     g = (g.detach().cpu().numpy().transpose(0, 2, 3, 4, 1) * 255.).astype(np.uint8)
     gt = (gt.detach().cpu().numpy().transpose(0, 2, 3, 4, 1) * 255.).astype(np.uint8)
 
-    refs, inps = x[..., 3:], x[..., :3]
+    # refs, inps = x[..., 3:], x[..., :3]
     folder = join(checkpoint_dir, "samples_step{:09d}".format(global_step))
     if not os.path.exists(folder): os.mkdir(folder)
-    collage = np.concatenate((refs, inps, g, gt), axis=-2)
+    collage = np.concatenate((g, gt), axis=-2)
     for batch_idx, c in enumerate(collage):
         for t in range(len(c)):
             cv2.imwrite('{}/{}_{}.jpg'.format(folder, batch_idx, t), c[t])
@@ -203,28 +319,37 @@ def train(device, model, disc, train_data_loader, test_data_loader, optimizer, d
           checkpoint_dir=None, checkpoint_interval=None, nepochs=None):
     global global_step, global_epoch
     resumed_step = global_step
-
+    print('Starting from step: {}'.format(resumed_step))
+    print('Starting from epoch: {}'.format(global_epoch))
     while global_epoch < nepochs:
         print('Starting Epoch: {}'.format(global_epoch))
         running_sync_loss, running_l1_loss, disc_loss, running_perceptual_loss = 0., 0., 0., 0.
         running_disc_real_loss, running_disc_fake_loss = 0., 0.
         prog_bar = tqdm(enumerate(train_data_loader))
-        for step, (x, indiv_mels, mel, gt) in prog_bar:
+        for step, ((indiv_mels, gt, idval, mel), (indiv_mels_LIA, img_LIA, idval_LIA)) in prog_bar:
+
             disc.train()
             model.train()
+            print('step: {}'.format(step))
 
-            x = x.to(device)
-            mel = mel.to(device)
+
             indiv_mels = indiv_mels.to(device)
             gt = gt.to(device)
+            idval = idval.to(device)
+
+            indiv_mels_LIA = indiv_mels.to(device)
+            img_LIA = img_LIA.to(device)
+            idval_LIA = idval_LIA.to(device)
 
             ### Train generator now. Remove ALL grads. 
             optimizer.zero_grad()
             disc_optimizer.zero_grad()
 
-            g = model(indiv_mels, x)
-
+            # unused indiv-mels_LIA, idval_LIA and idval
+            g = model(indiv_mels, gt, img_LIA, idval_LIA)
+            # pdb.set_trace()
             if hparams.syncnet_wt > 0.:
+                # quand il y a un audio original, on utilise la loss syncnet
                 sync_loss = get_sync_loss(mel, g)
             else:
                 sync_loss = 0.
@@ -249,7 +374,7 @@ def train(device, model, disc, train_data_loader, test_data_loader, optimizer, d
             disc_real_loss = F.binary_cross_entropy(pred, torch.ones((len(pred), 1)).to(device))
             disc_real_loss.backward()
 
-            pred = disc(g.detach())
+            pred = disc(img_LIA.detach())
             disc_fake_loss = F.binary_cross_entropy(pred, torch.zeros((len(pred), 1)).to(device))
             disc_fake_loss.backward()
 
@@ -259,7 +384,7 @@ def train(device, model, disc, train_data_loader, test_data_loader, optimizer, d
             running_disc_fake_loss += disc_fake_loss.item()
 
             if global_step % checkpoint_interval == 0:
-                save_sample_images(x, g, gt, global_step, checkpoint_dir)
+                save_sample_images(g, gt, global_step, checkpoint_dir)
 
             # Logs
             global_step += 1
@@ -381,13 +506,22 @@ def load_checkpoint(path, model, optimizer, reset_optimizer=False, overwrite_glo
     s = checkpoint["state_dict"]
     new_s = {}
     for k, v in s.items():
-        new_s[k.replace('module.', '')] = v
-    model.load_state_dict(new_s)
+        if 'face_encoder_blocks' not in k:
+            new_s[k.replace('module.', '')] = v
+    model.load_state_dict(new_s, strict=False)
     if not reset_optimizer:
         optimizer_state = checkpoint["optimizer"]
         if optimizer_state is not None:
             print("Load optimizer state from {}".format(path))
             optimizer.load_state_dict(checkpoint["optimizer"])
+    else:
+        pass
+        # # Reset the optimizer
+        # for state in optimizer.state.values():
+        #     for k, v in state.items():
+        #         if isinstance(v, torch.Tensor):
+        #             state[k] = torch.zeros_like(v)
+
     if overwrite_global_states:
         global_step = checkpoint["global_step"]
         global_epoch = checkpoint["global_epoch"]
@@ -401,6 +535,8 @@ if __name__ == "__main__":
     train_dataset = Dataset('train')
     test_dataset = Dataset('val')
 
+    x = train_dataset[0]
+
     train_data_loader = data_utils.DataLoader(
         train_dataset, batch_size=hparams.batch_size, shuffle=True,
         num_workers=hparams.num_workers)
@@ -412,7 +548,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if use_cuda else "cpu")
 
      # Model
-    model = Wav2Lip().to(device)
+    model = Wav2Lip(embedding_size=hparams.emb_size, num_ids=hparams.num_ids, img_size=hparams.img_size).to(device)
     disc = Wav2Lip_disc_qual().to(device)
 
     print('total trainable params {}'.format(sum(p.numel() for p in model.parameters() if p.requires_grad)))
@@ -424,7 +560,7 @@ if __name__ == "__main__":
                            lr=hparams.disc_initial_learning_rate, betas=(0.5, 0.999))
 
     if args.checkpoint_path is not None:
-        load_checkpoint(args.checkpoint_path, model, optimizer, reset_optimizer=False)
+        load_checkpoint(args.checkpoint_path, model, optimizer, reset_optimizer=True, overwrite_global_states=False)
 
     if args.disc_checkpoint_path is not None:
         load_checkpoint(args.disc_checkpoint_path, disc, disc_optimizer, 
